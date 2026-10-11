@@ -1,0 +1,181 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go package pattern(s) to test; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.13.15 (go generate)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.13.15"
+
+      - name: Regenerate godoc/static/static.go
+        env:
+          GO111MODULE: "on"
+          GOPROXY: "https://proxy.golang.org"
+        run: |
+          go version
+          go generate ./godoc/static
+          git status --short
+
+      - name: Set up Go 1.24 (module zip helper)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build create_mod helper
+        run: |
+          set -euo pipefail
+          HELPER=$(mktemp -d)
+          grep -v '^// +build ignore' .github/create_mod.go > "$HELPER/main.go"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      - name: Stage module source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/zipsrc"
+          tar -c --exclude=.git --exclude=.github -C "$GITHUB_WORKSPACE" . | tar -x -C "$RUNNER_TEMP/zipsrc"
+          test ! -e "$RUNNER_TEMP/zipsrc/.github"
+          test -f "$RUNNER_TEMP/zipsrc/go.mod"
+          test -f "$RUNNER_TEMP/zipsrc/.gitignore"
+          test -f "$RUNNER_TEMP/zipsrc/.gitattributes"
+
+      - name: Create module zip
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/create_mod" golang.org/x/tools v0.0.0-20200501065659-ab2804fb9c9d "$RUNNER_TEMP/zipsrc" "$RUNNER_TEMP/out/v0.0.0-20200501065659-ab2804fb9c9d.zip"
+          echo "zip entries: $(unzip -Z1 "$RUNNER_TEMP/out/v0.0.0-20200501065659-ab2804fb9c9d.zip" | wc -l)"
+          sha256sum "$RUNNER_TEMP/out/v0.0.0-20200501065659-ab2804fb9c9d.zip"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.0.0-20200501065659-ab2804fb9c9d.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go: "1.13.15"
+            arch: x64
+          # Go 1.13 has no darwin/arm64 build; runs under Rosetta.
+          - os: macos-14
+            go: "1.13.15"
+            arch: x64
+          - os: windows-latest
+            go: "1.13.15"
+            arch: x64
+    defaults:
+      run:
+        shell: bash
+    env:
+      GO111MODULE: "on"
+      GOPROXY: "https://proxy.golang.org"
+    steps:
+      # testdata goldens compare bytes; keep LF line endings on Windows.
+      - name: Disable CRLF conversion (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          architecture: ${{ matrix.arch }}
+
+      # Go 1.12/1.13 cgo cannot parse the DWARF emitted by current Xcode clang.
+      - name: Disable cgo (macOS)
+        if: runner.os == 'macOS'
+        run: echo "CGO_ENABLED=0" >> "$GITHUB_ENV"
+
+      # Go 1.13's prebuilt runtime/cgo needs msvcrt __iob_func; the runner's
+      # C:\mingw64 toolchain is UCRT, so install an msvcrt MINGW64 gcc.
+      - name: Set up MSYS2 MINGW64 gcc (Windows)
+        id: msys2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          update: false
+
+      - name: Use MSYS2 gcc and runner temp (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          echo "${{ steps.msys2.outputs.msys2-location }}/mingw64/bin" >> "$GITHUB_PATH"
+          echo "TEMP=${{ runner.temp }}" >> "$GITHUB_ENV"
+          echo "TMP=${{ runner.temp }}" >> "$GITHUB_ENV"
+
+      - name: Go environment
+        run: go version && go env
+
+      - name: Regenerate godoc/static/static.go
+        run: go generate ./godoc/static
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            # cmd/splitdwarf is !windows, so it has no main package on Windows.
+            go build $(go list ./... | grep -v '/cmd/splitdwarf$')
+          else
+            go build ./...
+          fi
+
+      # -p 1: cmd/godoc TestWebIndex waits only 2 minutes for the search index
+      # and times out under parallel package load.
+      - name: Test
+        run: |
+          set -o pipefail
+          set +e
+          go test -v -p 1 ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          # awk (not grep -c) so a zero count never trips errexit before the summary.
+          # LC_ALL=C: test output contains invalid UTF-8 that macOS awk rejects.
+          LC_ALL=C awk '
+            /^[[:space:]]*--- PASS/ { passed++ }
+            /^[[:space:]]*--- FAIL/ { failed++ }
+            /^[[:space:]]*--- SKIP/ { skipped++ }
+            /^ok /                  { pkg_ok++ }
+            /^FAIL[[:space:]]/      { pkg_fail++ }
+            END {
+              printf "TEST SUMMARY: passed=%d failed=%d skipped=%d packages_ok=%d packages_failed=%d exit_status=%s\n",
+                passed, failed, skipped, pkg_ok, pkg_fail, status
+            }
+          ' status="$status" "$RUNNER_TEMP/go-test.log"
+          exit "$status"

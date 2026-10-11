@@ -7,6 +7,9 @@
 package span_test
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/internal/span"
@@ -17,6 +20,14 @@ import (
 // tests by using only forward slashes, assuming that the standard library
 // functions filepath.ToSlash and filepath.FromSlash do not need testing.
 func TestURIFromPath(t *testing.T) {
+	// Drive-relative paths are resolved by filepath.Abs against the volume
+	// of the current working directory, which is not necessarily C:.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vol := strings.ToUpper(filepath.VolumeName(cwd))
+
 	for _, test := range []struct {
 		path, wantFile string
 		wantURI        span.URI
@@ -43,13 +54,13 @@ func TestURIFromPath(t *testing.T) {
 		},
 		{
 			path:     `\path\to\dir`,
-			wantFile: `C:\path\to\dir`,
-			wantURI:  span.URI("file:///C:/path/to/dir"),
+			wantFile: vol + `\path\to\dir`,
+			wantURI:  span.URI("file:///" + vol + "/path/to/dir"),
 		},
 		{
 			path:     `\a\b\c\src\bob.go`,
-			wantFile: `C:\a\b\c\src\bob.go`,
-			wantURI:  span.URI("file:///C:/a/b/c/src/bob.go"),
+			wantFile: vol + `\a\b\c\src\bob.go`,
+			wantURI:  span.URI("file:///" + vol + "/a/b/c/src/bob.go"),
 		},
 		{
 			path:     `c:\Go\src\bob george\george\george.go`,

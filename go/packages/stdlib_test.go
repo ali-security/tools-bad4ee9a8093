@@ -6,6 +6,7 @@ package packages_test
 
 import (
 	"bytes"
+	"go/build"
 	"io/ioutil"
 	"path/filepath"
 	"runtime"
@@ -66,6 +67,10 @@ func TestCgoOption(t *testing.T) {
 	}
 
 	testenv.NeedsGoPackages(t)
+
+	if !build.Default.CgoEnabled {
+		t.Skip("skipping: cgo is disabled (CGO_ENABLED=0)")
+	}
 
 	// TODO(adonovan): see if we can get away without these old
 	// go/loader hacks now that we use the go list command.
